@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dungeon Notepad & Quest Log</title>
+    <title>Cloud Dungeon Notepad</title>
+    <!-- Voeg de Supabase Client JS bibliotheek toe -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <style>
         body {
             margin: 0;
@@ -62,12 +64,14 @@
             cursor: pointer;
             font-weight: bold;
             font-size: 12px;
+            transition: background-color 0.2s;
         }
         .toolbar button:hover { background: #2980b9; }
         .toolbar button.success { background: #27ae60; }
         .toolbar button.success:hover { background: #219653; }
         .toolbar button.danger { background: #c0392b; }
         .toolbar button.danger:hover { background: #e74c3c; }
+        .toolbar button:disabled { background: #555; cursor: not-allowed; opacity: 0.7; }
 
         .notepad-body {
             flex: 1;
@@ -95,7 +99,21 @@
             font-size: 11px;
             color: #aaa;
             margin-left: auto;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
+
+        #sync-icon {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        #sync-icon.synced { background-color: #27ae60; } /* Groen */
+        #sync-icon.syncing { background-color: #f1c40f; } /* Geel */
+        #sync-icon.error { background-color: #c0392b; }   /* Rood */
 
         #toast-container {
             position: fixed;
@@ -112,6 +130,7 @@
             border-radius: 6px;
             font-size: 13px;
             box-shadow: 0 4px 12px rgba(0,0,0,0.7);
+            margin-bottom: 10px;
         }
     </style>
 </head>
@@ -119,60 +138,175 @@
 
     <div class="notepad-container">
         <div class="notepad-header">
-            <span>📜 Dungeon Quest Log & Notepad</span>
-            <span id="save-status" style="font-size: 11px; color: #aaa;">Auto-saved</span>
+            <span>☁️ Cloud Dungeon Notepad (Supabase Edition)</span>
+            <div class="status-info">
+                <span id="sync-icon" title="Sync Status"></span>
+                <span id="save-status-text">Initializing...</span>
+            </div>
         </div>
         
         <div class="toolbar">
-            <button onclick="toggleStrikethrough()"><s>S</s> Strike</button>
-            <button onclick="clearNotepad()" class="danger">Clear All</button>
-            <button onclick="saveManual()" class="success">Save Now</button>
-            <span class="status-info">Tip: Select text & strike, or paste images (Ctrl+V) directly!</span>
+            <button onclick="toggleStrikethrough()" id="btn-strike"><s>S</s> Strike</button>
+            <button onclick="clearNotepad()" class="danger" id="btn-clear">Clear All</button>
+            <button onclick="forceSaveManual()" class="success" id="btn-save">Sync Now</button>
         </div>
 
-        <div id="notepad-content" class="notepad-body" contenteditable="true" placeholder="Write your notes, bugs, or to-do items here..."></div>
+        <div id="notepad-content" class="notepad-body" contenteditable="true" placeholder="Write your notes, bugs, or to-do items here... Loading from Cloud..."></div>
     </div>
 
     <div id="toast-container"></div>
 
     <script>
-        const notepad = document.getElementById('notepad-content');
-        const saveStatus = document.getElementById('save-status');
+        // --- 1. Supabase Configuratie ---
+        // VUL DEZE REGELS IN MET JE EIGEN GEGEVENS UIT HET SUPABASE DASHBOARD!
+        const SUPABASE_URL = 'https://mgqoxmnryqekrpjglffb.supabase.co'; 
+    const SUPABASE_ANON_KEY = 'sb_publishable_btgAerx5A8O7urSEflRDAg_8NSdtoOu';
 
-        // 1. Laden bij opstarten
-        function loadNotes() {
-            const savedNotes = localStorage.getItem('dungeon_notepad_data');
-            if (savedNotes) {
-                notepad.innerHTML = savedNotes;
+        const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+        const notepad = document.getElementById('notepad-content');
+        const saveStatusText = document.getElementById('save-status-text');
+        const syncIcon = document.getElementById('sync-icon');
+        const toolbarButtons = document.querySelectorAll('.toolbar button');
+
+        // We gebruiken voor nu vast ID 1.
+        const NOTE_ID_GLOBAL = 1; 
+
+        function setSyncState(state) {
+            syncIcon.className = state;
+            switch(state) {
+                case 'synced': saveStatusText.textContent = "Synced with Cloud"; break;
+                case 'syncing': saveStatusText.textContent = "Saving to Cloud..."; break;
+                case 'error': saveStatusText.textContent = "Sync Error!"; break;
             }
         }
-        loadNotes();
 
-        // 2. Automatisch opslaan bij typen of wijzigen
-        let saveTimeout;
-        notepad.addEventListener('input', () => {
-            saveStatus.textContent = "Unsaved...";
-            clearTimeout(saveTimeout);
-            saveTimeout = setTimeout(() => {
-                localStorage.setItem('dungeon_notepad_data', notepad.innerHTML);
-                saveStatus.textContent = "Auto-saved";
-            }, 500);
-        });
-
-        function saveManual() {
-            localStorage.setItem('dungeon_notepad_data', notepad.innerHTML);
-            saveStatus.textContent = "Saved!";
-            showToast("📝 Notes successfully saved to local storage!");
+        function setEditorDisabled(disabled) {
+            notepad.contentEditable = !disabled;
+            toolbarButtons.forEach(btn => btn.disabled = disabled);
+            if(disabled) {
+                notepad.style.opacity = '0.6';
+            } else {
+                notepad.style.opacity = '1';
+            }
         }
 
-        // 3. Tekst doorstrepen via knop
+        // --- 2. Data Laden vanuit Supabase ---
+        async function loadNotesFromCloud() {
+            setEditorDisabled(true);
+            saveStatusText.textContent = "Connecting to cloud...";
+            
+            try {
+                const { data, error } = await supabaseClient
+                    .from('dungeon_notes')
+                    .select('content')
+                    .eq('id', NOTE_ID_GLOBAL)
+                    .maybeSingle(); // Zorgt dat je geen fout krijgt als er nog geen rij is
+
+                if (error) throw error;
+
+                if (data && data.content) {
+                    notepad.innerHTML = data.content;
+                    setSyncState('synced');
+                } else {
+                    // Geen notitie gevonden in DB, laad lokale default
+                    notepad.innerHTML = '<p>Welcome to your Cloud Dungeon Notepad!</p>';
+                    setSyncState('synced');
+                }
+                
+                setEditorDisabled(false);
+            } catch (err) {
+                console.error("Error loading:", err);
+                setSyncState('error');
+                showToast("⚠️ Failed to load notes from cloud.", true);
+                setEditorDisabled(false);
+            }
+        }
+
+        // Initial load
+        if(SUPABASE_URL.startsWith('JOUW')) {
+             notepad.innerHTML = '<div style="color: #c0392b;"><h2>CONFIG ERROR</h2><p>Vul je Supabase URL en ANON_KEY in de code in!</p></div>';
+        } else {
+             loadNotesFromCloud();
+        }
+
+        // --- 3. Data Opslaan in Supabase ---
+        let saveTimeout;
+        let isForceSaving = false;
+
+        // Automatisch opslaan bij typen (met debounce: wacht tot men stopt met typen)
+        notepad.addEventListener('input', () => {
+            if(isForceSaving) return; // Sla over als we net een geforceerde save doen
+
+            setSyncState('syncing');
+            clearTimeout(saveTimeout);
+            
+            // Wacht 1 seconde na de laatste toetsaanslag voordat we saven
+            saveTimeout = setTimeout(saveToSupabaseCloud, 1000);
+        });
+
+        async function saveToSupabaseCloud() {
+            const contentToSave = notepad.innerHTML;
+            isForceSaving = false;
+
+            try {
+                // UPSERT: Update als ID bestaat, Insert als ID niet bestaat
+                const { error } = await supabaseClient
+                    .from('dungeon_notes')
+                    .upsert({ 
+                        id: NOTE_ID_GLOBAL, 
+                        content: contentToSave,
+                        updated_at: new Date().toISOString() 
+                    });
+
+                if (error) throw error;
+                setSyncState('synced');
+            } catch (err) {
+                console.error("Error saving:", err);
+                setSyncState('error');
+                showToast("⚠️ Failed to save notes to cloud.", true);
+            }
+        }
+
+        function forceSaveManual() {
+            isForceSaving = true; // Voorkom dat input event tegelijkertijd saved
+            clearTimeout(saveTimeout);
+            setSyncState('syncing');
+            saveToSupabaseCloud().then(() => {
+                showToast("☁️ Notes Synced Now!");
+            });
+        }
+
+        // --- 4. Hulpfuncties ---
         function toggleStrikethrough() {
             document.execCommand('styleWithCSS', false, true);
             document.execCommand('strikeThrough', false, null);
             notepad.focus();
+            // Trigger een input event zodat we syncen
+            notepad.dispatchEvent(new Event('input', { bubbles: true }));
         }
 
-        // 4. Afbeeldingen plakken vanaf klembord (Ctrl+V)
+        async function clearNotepad() {
+            if (confirm("Are you sure you want to clear all notes from the cloud?")) {
+                notepad.innerHTML = "";
+                setSyncState('syncing');
+                try {
+                     // We deleten niet echt, maar updaten met lege content
+                     const { error } = await supabaseClient
+                        .from('dungeon_notes')
+                        .update({ content: "", updated_at: new Date().toISOString() })
+                        .eq('id', NOTE_ID_GLOBAL);
+                     if(error) throw error;
+                     setSyncState('synced');
+                     showToast("Notepad cleared in cloud.");
+                } catch (err) {
+                    setSyncState('error');
+                    showToast("Error clearing cloud notepad.");
+                }
+            }
+        }
+
+        // Afbeeldingen plakken (zelfde logica als eerder)
         notepad.addEventListener('paste', (e) => {
             const items = (e.clipboardData || e.originalEvent.clipboardData).items;
             for (let item of items) {
@@ -184,7 +318,6 @@
                         const base64Img = event.target.result;
                         const imgHTML = `<br><img src="${base64Img}"><br>`;
                         
-                        // Plaats afbeelding op huidige cursorpositie
                         const selection = window.getSelection();
                         if (!selection.rangeCount) return;
                         selection.deleteFromDocument();
@@ -192,35 +325,26 @@
                         const div = document.createElement('div');
                         div.innerHTML = imgHTML;
                         let frag = document.createDocumentFragment(), node, lastNode;
-                        while ((node = div.firstChild)) {
-                            lastNode = frag.appendChild(node);
-                        }
+                        while ((node = div.firstChild)) { lastNode = frag.appendChild(node); }
                         selection.getRangeAt(0).insertNode(frag);
                         
-                        // Trigger opslaan
-                        localStorage.setItem('dungeon_notepad_data', notepad.innerHTML);
-                        showToast("🖼️ Screenshot pasted successfully!");
+                        // Trigger sync
+                        notepad.dispatchEvent(new Event('input', { bubbles: true }));
+                        showToast("🖼️ Screenshot pasted and syncing!");
                     };
                     reader.readAsDataURL(blob);
                 }
             }
         });
 
-        function clearNotepad() {
-            if (confirm("Are you sure you want to clear all notes?")) {
-                notepad.innerHTML = "";
-                localStorage.removeItem('dungeon_notepad_data');
-                showToast("Notepad cleared.");
-            }
-        }
-
-        function showToast(message) {
+        function showToast(message, isError = false) {
             const container = document.getElementById('toast-container');
             const toast = document.createElement('div');
             toast.className = 'toast-message';
+            if(isError) toast.style.borderColor = '#c0392b';
             toast.textContent = message;
             container.appendChild(toast);
-            setTimeout(() => { toast.remove(); }, 2500);
+            setTimeout(() => { toast.remove(); }, 3000);
         }
     </script>
 </body>
